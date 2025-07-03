@@ -48,6 +48,8 @@ const UserSchema = new mongoose.Schema({
       stripeItemId: String,
       numAdults: { type: Number, default: 0 }, // ADD THIS
       numChildren: { type: Number, default: 0 }, // ADD THIS
+
+      sessionStart: Date, // When hour-long session began
     },
   ],
   photo: String,
@@ -70,6 +72,8 @@ const UserSchema = new mongoose.Schema({
       lastCheck: Date,
       createdAt: { type: Date, default: Date.now },
       stripeItemId: String,
+
+      sessionStart: Date, // When hour-long session began
     },
   ],
   familyTiers: [String],
@@ -81,6 +85,77 @@ const UserSchema = new mongoose.Schema({
   stripeCustomerId: String,
   stripeSubscriptionId: String,
   familyItemIds: [String],
+});
+
+// Add this middleware to automatically process sessions before returning user data
+UserSchema.pre("save", function (next) {
+  const now = new Date();
+
+  // Process memberships
+  this.memberships.forEach((m) => {
+    if (m.paymentStatus !== "active") return;
+
+    // Walk-in session expiration
+    if (m.tier === "walk-in" && m.sessionStart) {
+      const sessionEnd = new Date(m.sessionStart.getTime() + 36 * 1000); // 1 hour
+
+      if (now > sessionEnd) {
+        m.visitsLeft -= 1;
+        m.sessionStart = null;
+        m.lastCheck = now; // Update lastCheck on expiration
+        if (m.visitsLeft <= 0) m.paymentStatus = "expired";
+      }
+    }
+    // Non-walk-in memberships
+    else if (m.tier !== "walk-in" && m.lastCheck) {
+      const lastCheckTime = new Date(m.lastCheck).getTime();
+      const twentyFourHours = 24 * 60 * 60 * 1000;
+
+      // Reset visits after 24 hours
+      if (now - lastCheckTime > twentyFourHours) {
+        m.visitsLeft =
+          m.tier === "legacy-maker"
+            ? Number.MAX_SAFE_INTEGER
+            : m.tier === "leader"
+            ? 5
+            : m.tier === "supporter"
+            ? 2
+            : 1;
+      }
+    }
+  });
+
+  // Process family members (same logic)
+  this.family.forEach((f) => {
+    if (f.paymentStatus !== "active") return;
+
+    if (f.tier === "walk-in" && f.sessionStart) {
+      const sessionEnd = new Date(f.sessionStart.getTime() + 3600000);
+
+      if (now > sessionEnd) {
+        f.visitsLeft -= 1;
+        f.sessionStart = null;
+        f.lastCheck = now; // Update lastCheck
+        if (f.visitsLeft <= 0) f.paymentStatus = "expired";
+      }
+    } else if (f.tier !== "walk-in" && f.lastCheck) {
+      const lastCheckTime = new Date(f.lastCheck).getTime();
+      const twentyFourHours = 24 * 60 * 60 * 1000;
+
+      if (now - lastCheckTime > twentyFourHours) {
+        f.visitsLeft =
+          f.tier === "legacy-maker"
+            ? Number.MAX_SAFE_INTEGER
+            : f.tier === "leader"
+            ? 5
+            : f.tier === "supporter"
+            ? 2
+            : 1;
+      }
+    }
+  });
+
+  next();
 });
 const User = mongoose.model("Users", UserSchema);
 
@@ -1188,107 +1263,90 @@ app.post("/api/walk-in", async (req, res) => {
   }
 });
 
-// Helper to deduct visits for all users
-// async function deductVisitsForAll() {
-//   const now = new Date();
-//   const DAY_MS = 24 * 60 * 60 * 1000;
+// app.post("/api/check-visit", async (req, res) => {
+//   const { userId } = req.body;
+//   try {
+//     const user = await User.findById(userId);
+//     if (!user) return res.status(404).send({ error: "User not found" });
+//     const now = new Date();
 
-//   const users = await User.find({
-//     $or: [
-//       { "memberships.paymentStatus": "active" },
-//       { "family.paymentStatus": "active" },
-//     ],
-//   });
-
-//   console.log(`[Cron] Deducted visits for ${users} users`);
-
-//   for (const user of users) {
-//     let changed = false;
+//     // Define cooldown function for visit deduction
+//     const getCooldown = (tier) => {
+//       if (tier === "walk-in") {
+//         return 60 * 60 * 1000; // 1 hour for walk-ins
+//         // return 20 * 1000; // 1 hour for walk-ins
+//       } else {
+//         return 24 * 60 * 60 * 1000; // 24 hours for other tiers, adjust as needed
+//         // return 20 * 1000; // 24 hours for other tiers, adjust as needed
+//       }
+//     };
 
 //     // Process memberships
-//     for (const m of user.memberships) {
+//     user.memberships.forEach((m) => {
 //       if (m.paymentStatus === "active" && m.visitsLeft > 0) {
-//         if (!m.lastCheck) {
+//         const cooldown = getCooldown(m.tier);
+//         if (!m.lastCheck || now - new Date(m.lastCheck) > cooldown) {
+//           m.visitsLeft -= 1; // Deduct visit only after cooldown period
 //           m.lastCheck = now;
-//           changed = true;
-//         } else if (now - new Date(m.lastCheck) >= DAY_MS) {
-//           m.visitsLeft -= 1;
-//           m.lastCheck = now;
-//           if (m.visitsLeft === 0) m.paymentStatus = "expired";
-//           changed = true;
-//         }
+//           if (m.visitsLeft === 0) {
+//             m.paymentStatus = "expired";
+//           }
+//         } // Else, retain visitsLeft if within cooldown
 //       }
-//     }
+//     });
 
 //     // Process family members
-//     for (const f of user.family) {
+//     user.family.forEach((f) => {
 //       if (f.paymentStatus === "active" && f.visitsLeft > 0) {
-//         if (!f.lastCheck) {
+//         const cooldown = getCooldown(f.tier);
+//         if (!f.lastCheck || now - new Date(f.lastCheck) > cooldown) {
+//           f.visitsLeft -= 1; // Deduct visit only after cooldown period
 //           f.lastCheck = now;
-//           changed = true;
-//         } else if (now - new Date(f.lastCheck) >= DAY_MS) {
-//           f.visitsLeft -= 1;
-//           f.lastCheck = now;
-//           if (f.visitsLeft === 0) f.paymentStatus = "expired";
-//           changed = true;
-//         }
+//           if (f.visitsLeft === 0) {
+//             f.paymentStatus = "expired";
+//           }
+//         } // Else, retain visitsLeft if within cooldown
 //       }
-//     }
+//     });
 
-//     if (changed) await user.save();
+//     await user.save();
+//     res.send({ success: true });
+//   } catch (error) {
+//     console.error("Error in /api/check-visit:", error);
+//     res.status(500).send({ error: "Failed to check visit" });
 //   }
-
-//   console.log(`[Cron] Deducted visits at ${now.toISOString()}`);
-// }
-
-// // Schedule daily at midnight
-// cron.schedule("0 0 * * *", () => {
-//   deductVisitsForAll().catch((err) => console.error("[Cron] Error:", err));
 // });
 
 app.post("/api/check-visit", async (req, res) => {
-  const { userId } = req.body;
+  const { userId, membershipIds = [], familyIds = [] } = req.body;
   try {
     const user = await User.findById(userId);
     if (!user) return res.status(404).send({ error: "User not found" });
     const now = new Date();
 
-    // Define cooldown function for visit deduction
-    const getCooldown = (tier) => {
-      if (tier === "walk-in") {
-        return 60 * 60 * 1000; // 1 hour for walk-ins
-        // return 20 * 1000; // 1 hour for walk-ins
-      } else {
-        return 24 * 60 * 60 * 1000; // 24 hours for other tiers, adjust as needed
-        // return 20 * 1000; // 24 hours for other tiers, adjust as needed
-      }
-    };
-
-    // Process memberships
+    // Process selected memberships
     user.memberships.forEach((m) => {
-      if (m.paymentStatus === "active" && m.visitsLeft > 0) {
-        const cooldown = getCooldown(m.tier);
-        if (!m.lastCheck || now - new Date(m.lastCheck) > cooldown) {
-          m.visitsLeft -= 1; // Deduct visit only after cooldown period
-          m.lastCheck = now;
-          if (m.visitsLeft === 0) {
-            m.paymentStatus = "expired";
+      if (membershipIds.includes(m._id.toString())) {
+        if (m.paymentStatus === "active" && m.visitsLeft > 0) {
+          // Start session for walk-ins
+          if (m.tier === "walk-in") {
+            m.sessionStart = now;
           }
-        } // Else, retain visitsLeft if within cooldown
+          // Update last check time for all types
+          m.lastCheck = now;
+        }
       }
     });
 
-    // Process family members
+    // Process selected family members
     user.family.forEach((f) => {
-      if (f.paymentStatus === "active" && f.visitsLeft > 0) {
-        const cooldown = getCooldown(f.tier);
-        if (!f.lastCheck || now - new Date(f.lastCheck) > cooldown) {
-          f.visitsLeft -= 1; // Deduct visit only after cooldown period
-          f.lastCheck = now;
-          if (f.visitsLeft === 0) {
-            f.paymentStatus = "expired";
+      if (familyIds.includes(f._id.toString())) {
+        if (f.paymentStatus === "active" && f.visitsLeft > 0) {
+          if (f.tier === "walk-in") {
+            f.sessionStart = now;
           }
-        } // Else, retain visitsLeft if within cooldown
+          f.lastCheck = now;
+        }
       }
     });
 
@@ -1299,6 +1357,7 @@ app.post("/api/check-visit", async (req, res) => {
     res.status(500).send({ error: "Failed to check visit" });
   }
 });
+
 app.get("/api/admin/user", async (req, res) => {
   const { phone } = req.query;
   try {
