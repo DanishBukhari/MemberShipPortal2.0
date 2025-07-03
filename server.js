@@ -97,7 +97,7 @@ UserSchema.pre("save", function (next) {
 
     // Walk-in session expiration
     if (m.tier === "walk-in" && m.sessionStart) {
-      const sessionEnd = new Date(m.sessionStart.getTime() + 36 * 1000); // 1 hour
+      const sessionEnd = new Date(m.sessionStart.getTime() + 60 * 60 * 1000); // 1 hour
 
       if (now > sessionEnd) {
         m.visitsLeft -= 1;
