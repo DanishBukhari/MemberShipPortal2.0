@@ -50,6 +50,7 @@ const UserSchema = new mongoose.Schema({
       numChildren: { type: Number, default: 0 }, // ADD THIS
 
       sessionStart: Date, // When hour-long session began
+      sessionEnd: Date, // When hour-long session ended
     },
   ],
   photo: String,
@@ -74,6 +75,7 @@ const UserSchema = new mongoose.Schema({
       stripeItemId: String,
 
       sessionStart: Date, // When hour-long session began
+      sessionEnd: Date, // When hour-long session ended
     },
   ],
   familyTiers: [String],
@@ -87,76 +89,6 @@ const UserSchema = new mongoose.Schema({
   familyItemIds: [String],
 });
 
-// Add this middleware to automatically process sessions before returning user data
-UserSchema.pre("save", function (next) {
-  const now = new Date();
-
-  // Process memberships
-  this.memberships.forEach((m) => {
-    if (m.paymentStatus !== "active") return;
-
-    // Walk-in session expiration
-    if (m.tier === "walk-in" && m.sessionStart) {
-      const sessionEnd = new Date(m.sessionStart.getTime() + 60 * 60 * 1000); // 1 hour
-
-      if (now > sessionEnd) {
-        m.visitsLeft -= 1;
-        m.sessionStart = null;
-        m.lastCheck = now; // Update lastCheck on expiration
-        if (m.visitsLeft <= 0) m.paymentStatus = "expired";
-      }
-    }
-    // Non-walk-in memberships
-    else if (m.tier !== "walk-in" && m.lastCheck) {
-      const lastCheckTime = new Date(m.lastCheck).getTime();
-      const twentyFourHours = 24 * 60 * 60 * 1000;
-
-      // Reset visits after 24 hours
-      if (now - lastCheckTime > twentyFourHours) {
-        m.visitsLeft =
-          m.tier === "legacy-maker"
-            ? Number.MAX_SAFE_INTEGER
-            : m.tier === "leader"
-            ? 5
-            : m.tier === "supporter"
-            ? 2
-            : 1;
-      }
-    }
-  });
-
-  // Process family members (same logic)
-  this.family.forEach((f) => {
-    if (f.paymentStatus !== "active") return;
-
-    if (f.tier === "walk-in" && f.sessionStart) {
-      const sessionEnd = new Date(f.sessionStart.getTime() + 3600000);
-
-      if (now > sessionEnd) {
-        f.visitsLeft -= 1;
-        f.sessionStart = null;
-        f.lastCheck = now; // Update lastCheck
-        if (f.visitsLeft <= 0) f.paymentStatus = "expired";
-      }
-    } else if (f.tier !== "walk-in" && f.lastCheck) {
-      const lastCheckTime = new Date(f.lastCheck).getTime();
-      const twentyFourHours = 24 * 60 * 60 * 1000;
-
-      if (now - lastCheckTime > twentyFourHours) {
-        f.visitsLeft =
-          f.tier === "legacy-maker"
-            ? Number.MAX_SAFE_INTEGER
-            : f.tier === "leader"
-            ? 5
-            : f.tier === "supporter"
-            ? 2
-            : 1;
-      }
-    }
-  });
-
-  next();
-});
 const User = mongoose.model("Users", UserSchema);
 
 const transporter = nodemailer.createTransport({
@@ -371,8 +303,15 @@ app.post(
 
 app.post("/api/users", async (req, res) => {
   const { name, email, phone, memberships } = req.body;
+  const emailLower = email.toLowerCase();
+
   try {
-    let user = await User.findOne({ email: email.toLowerCase() });
+    // 1. Check for existing user with matching email AND phone
+    let user = await User.findOne({
+      email: emailLower,
+      phone: phone,
+    });
+
     const primaryMembership = {
       _id: new mongoose.Types.ObjectId(),
       tier: memberships[0],
@@ -386,34 +325,71 @@ app.post("/api/users", async (req, res) => {
           : 1,
       paymentStatus: "pending",
     };
+
     const familyTiers = memberships.slice(1);
 
     if (user) {
-      user.memberships = [primaryMembership];
-      user.familyTiers = familyTiers;
+      // 2. Found matching user - add membership
+      user.memberships.push(primaryMembership);
+
+      // MERGE family tiers instead of replacing
+      user.familyTiers = [...(user.familyTiers || []), ...familyTiers];
     } else {
+      // 3. No matching user - check for conflicts
+      const existingEmail = await User.findOne({ email: emailLower });
+      const existingPhone = await User.findOne({ phone });
+
+      if (existingEmail || existingPhone) {
+        let errorMessage = "";
+        if (existingEmail && existingPhone) {
+          errorMessage =
+            "Both email and phone already exist with different accounts";
+        } else if (existingEmail) {
+          errorMessage = "Email already exists with a different phone";
+        } else {
+          errorMessage = "Phone number already exists with a different email";
+        }
+        return res.status(400).send({ error: errorMessage });
+      }
+
+      // 4. Create new user since no conflicts
       user = new User({
         name,
-        email: email.toLowerCase(),
+        email: emailLower,
         phone,
         memberships: [primaryMembership],
         familyTiers,
       });
     }
-    await createGHLContact(
-      name,
-      email.toLowerCase(),
-      phone,
-      memberships[0],
-      null,
-    );
+
+    // 5. GHL contact handling
+    let contactId = user?.ghlContactId;
+    if (!contactId) {
+      contactId = await createGHLContact(
+        name,
+        emailLower,
+        phone,
+        memberships[0],
+        null,
+      );
+      user.ghlContactId = contactId;
+    }
+
     await user.save();
     res.status(201).json(user);
   } catch (error) {
+    // Handle duplicate key errors
+    if (error.code === 11000) {
+      const key = Object.keys(error.keyPattern)[0];
+      return res.status(400).send({
+        error: `${key.replace(/^\$/, "")} already exists`,
+      });
+    }
     console.error("Error in /api/users:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
+
 const updateGHLContactAfterPayment = async (
   contactId,
   email,
@@ -465,6 +441,7 @@ app.post("/api/payment", async (req, res) => {
 
   try {
     let user = await User.findOne({ email: emailLower });
+    console.log("user kk", user);
     const password = crypto.randomBytes(8).toString("hex");
     const hashedPassword = await bcrypt.hash(password, 10);
 
@@ -603,21 +580,40 @@ app.post("/api/payment", async (req, res) => {
         const familyItemIds = subscription.items.data
           .slice(1)
           .map((item) => item.id);
-        user =
-          user ||
-          new User({
+
+        // Handle user creation/update
+        if (user) {
+          user.memberships = user.memberships.filter(
+            (m) =>
+              !(m.tier === memberships[0] && m.paymentStatus === "pending"),
+          );
+          // Preserve existing memberships while adding the new one
+          console.log("user membership ache? 1", user.memberships);
+
+          user.memberships.push(primaryMembership);
+          console.log("user ache?", user);
+          console.log("user membership ache? 2", user.memberships);
+        } else {
+          // Create new user with initial membership
+          user = new User({
             name,
             email: email.toLowerCase(),
             phone,
             paymentStatus: "active",
             password: hashedPassword,
             profileComplete: false,
+            memberships: [primaryMembership],
           });
-        user.memberships = [primaryMembership];
+        }
+
+        // Update user properties
         user.familyTiers = memberships.slice(1);
         user.stripeCustomerId = customer.id;
         user.stripeSubscriptionId = subscription.id;
-        user.familyItemIds = familyItemIds;
+
+        // Preserve existing familyItemIds and add new ones
+        user.familyItemIds = [...(user.familyItemIds || []), ...familyItemIds];
+
         if (!user.password) user.password = hashedPassword;
 
         let contactId = user?.ghlContactId;
@@ -631,12 +627,14 @@ app.post("/api/payment", async (req, res) => {
           );
           user.ghlContactId = contactId;
         }
+
         await updateGHLContactAfterPayment(
           contactId,
           email.toLowerCase(),
           null,
           password,
         );
+
         await user.save();
         return res
           .status(200)
@@ -1323,17 +1321,53 @@ app.post("/api/check-visit", async (req, res) => {
     const user = await User.findById(userId);
     if (!user) return res.status(404).send({ error: "User not found" });
     const now = new Date();
+    const errors = [];
 
     // Process selected memberships
     user.memberships.forEach((m) => {
       if (membershipIds.includes(m._id.toString())) {
-        if (m.paymentStatus === "active" && m.visitsLeft > 0) {
-          // Start session for walk-ins
-          if (m.tier === "walk-in") {
-            m.sessionStart = now;
+        // Check if membership is active and has visits left
+        if (m.paymentStatus !== "active" || m.visitsLeft <= 0) {
+          errors.push(
+            `Membership ${m.tier} is not active or has no visits left`,
+          );
+          return;
+        }
+
+        // Check cooldown - minimum 5 minutes between check-ins
+        if (m.lastCheck && now - new Date(m.lastCheck) < 300000) {
+          errors.push(`Membership ${m.tier} was checked in too recently`);
+          return;
+        }
+
+        // Check if session is already active
+        if (m.sessionStart) {
+          const sessionDuration =
+            m.tier === "walk-in"
+              ? 3600000
+              : m.tier === "legacy-maker"
+              ? 3600000
+              : 86400000;
+          const sessionEnd = new Date(
+            m.sessionStart.getTime() + sessionDuration,
+          );
+
+          if (now < sessionEnd) {
+            errors.push(`Membership ${m.tier} has an active session`);
+            return;
           }
-          // Update last check time for all types
-          m.lastCheck = now;
+        }
+
+        // Set sessionStart and sessionEnd
+        m.sessionStart = now;
+        m.lastCheck = now; // Update last check time
+
+        if (m.tier === "walk-in") {
+          m.sessionEnd = new Date(now.getTime() + 3600000); // 1 hour
+        } else if (m.tier === "legacy-maker") {
+          m.sessionEnd = new Date(now.getTime() + 3600000); // 1 hour
+        } else {
+          m.sessionEnd = new Date(now.getTime() + 86400000); // 24 hours
         }
       }
     });
@@ -1341,14 +1375,59 @@ app.post("/api/check-visit", async (req, res) => {
     // Process selected family members
     user.family.forEach((f) => {
       if (familyIds.includes(f._id.toString())) {
-        if (f.paymentStatus === "active" && f.visitsLeft > 0) {
-          if (f.tier === "walk-in") {
-            f.sessionStart = now;
+        // Check if family member is active and has visits left
+        if (f.paymentStatus !== "active" || f.visitsLeft <= 0) {
+          errors.push(
+            `Family member ${f.name} is not active or has no visits left`,
+          );
+          return;
+        }
+
+        // Check cooldown - minimum 5 minutes between check-ins
+        if (f.lastCheck && now - new Date(f.lastCheck) < 300000) {
+          errors.push(`Family member ${f.name} was checked in too recently`);
+          return;
+        }
+
+        // Check if session is already active
+        if (f.sessionStart) {
+          const sessionDuration =
+            f.tier === "walk-in"
+              ? 3600000
+              : f.tier === "legacy-maker"
+              ? 3600000
+              : 86400000;
+          const sessionEnd = new Date(
+            f.sessionStart.getTime() + sessionDuration,
+          );
+
+          if (now < sessionEnd) {
+            errors.push(`Family member ${f.name} has an active session`);
+            return;
           }
-          f.lastCheck = now;
+        }
+
+        // Set sessionStart and sessionEnd
+        f.sessionStart = now;
+        f.lastCheck = now; // Update last check time
+
+        if (f.tier === "walk-in") {
+          f.sessionEnd = new Date(now.getTime() + 3600000); // 1 hour
+        } else if (f.tier === "legacy-maker") {
+          f.sessionEnd = new Date(now.getTime() + 3600000); // 1 hour
+        } else {
+          f.sessionEnd = new Date(now.getTime() + 86400000); // 24 hours
         }
       }
     });
+
+    if (errors.length > 0) {
+      return res.status(400).send({
+        success: false,
+        message: "Some check-ins failed",
+        errors,
+      });
+    }
 
     await user.save();
     res.send({ success: true });
@@ -1365,20 +1444,95 @@ app.get("/api/admin/user", async (req, res) => {
     if (!user) return res.status(404).send({ error: "User not found" });
 
     const now = new Date();
+    let modified = false;
 
+    // Process memberships
     user.memberships.forEach((m) => {
+      if (m.paymentStatus === "active" && m.sessionStart) {
+        let sessionDuration = 0;
+
+        // Determine session duration based on tier
+        if (m.tier === "walk-in") {
+          sessionDuration = 3600000; // 1 hour
+        } else if (m.tier === "legacy-maker") {
+          sessionDuration = 3600000; // 1 hour (no deduction)
+        } else {
+          sessionDuration = 86400000; // 24 hours
+        }
+
+        const sessionEnd = new Date(m.sessionStart.getTime() + sessionDuration);
+
+        // Check if session has ended
+        if (now > sessionEnd) {
+          // Deduct visits for non-legacy tiers
+          if (m.tier !== "legacy-maker") {
+            m.visitsLeft -= 1;
+            if (m.visitsLeft < 0) m.visitsLeft = 0;
+          }
+
+          // Clear session
+          m.sessionStart = null;
+
+          // Mark as expired if no visits left
+          if (m.visitsLeft <= 0 && m.tier !== "legacy-maker") {
+            m.paymentStatus = "expired";
+          }
+
+          modified = true;
+        }
+      }
+
+      // Old walk-in expiry check (keep this for backward compatibility)
       if (m.tier === "walk-in" && now > new Date(m.expiry)) {
         m.paymentStatus = "expired";
         m.visitsLeft = 0;
+        modified = true;
       }
     });
 
+    // Process family members
     user.family.forEach((f) => {
+      if (f.paymentStatus === "active" && f.sessionStart) {
+        let sessionDuration = 0;
+
+        if (f.tier === "walk-in") {
+          sessionDuration = 3600000; // 1 hour
+        } else if (f.tier === "legacy-maker") {
+          sessionDuration = 3600000; // 1 hour (no deduction)
+        } else {
+          sessionDuration = 86400000; // 24 hours
+        }
+
+        const sessionEnd = new Date(f.sessionStart.getTime() + sessionDuration);
+
+        if (now > sessionEnd) {
+          if (f.tier !== "legacy-maker") {
+            f.visitsLeft -= 1;
+            if (f.visitsLeft < 0) f.visitsLeft = 0;
+          }
+
+          f.sessionStart = null;
+
+          if (f.visitsLeft <= 0 && f.tier !== "legacy-maker") {
+            f.paymentStatus = "expired";
+          }
+
+          modified = true;
+        }
+      }
+
+      // Old walk-in expiry check
       if (f.tier === "walk-in" && now > new Date(f.expiry)) {
         f.paymentStatus = "expired";
         f.visitsLeft = 0;
+        modified = true;
       }
     });
+
+    // Save if any modifications were made
+    if (modified) {
+      await user.save();
+    }
 
     const responseData = {
       _id: user._id,
@@ -1392,8 +1546,9 @@ app.get("/api/admin/user", async (req, res) => {
         expiry: m.expiry,
         paymentStatus: m.paymentStatus,
         createdAt: m.createdAt,
-        numAdults: m.numAdults, // Add this
-        numChildren: m.numChildren, // Add this
+        numAdults: m.numAdults,
+        numChildren: m.numChildren,
+        sessionStart: m.sessionStart, // Include session info in response
       })),
       paymentStatus: user.paymentStatus,
       family: user.family.map((f) => ({
@@ -1407,6 +1562,7 @@ app.get("/api/admin/user", async (req, res) => {
         expiry: f.expiry,
         paymentStatus: f.paymentStatus,
         createdAt: f.createdAt,
+        sessionStart: f.sessionStart, // Include session info in response
       })),
       numAdults: user.numAdults,
       numChildren: user.numChildren,
@@ -1414,7 +1570,6 @@ app.get("/api/admin/user", async (req, res) => {
       stripeSubscriptionId: user.stripeSubscriptionId,
     };
 
-    await user.save();
     res.send(responseData);
   } catch (error) {
     console.error("Error in /api/admin/user:", error);
