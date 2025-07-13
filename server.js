@@ -103,7 +103,7 @@ const formatDateForGHL = (date) => {
   return `${year}-${month}-${day}`;
 };
 
-const createGHLContact = async (name, email, phone, tag, expiry) => {
+const createGHLContact = async (name, email, phone, tier, expiry) => {
   try {
     const emailLower = email.toLowerCase();
     const response = await axios.get(
@@ -113,7 +113,7 @@ const createGHLContact = async (name, email, phone, tag, expiry) => {
       { headers: { Authorization: `Bearer ${process.env.GHL_API_TOKEN}` } },
     );
     const dateString = expiry ? formatDateForGHL(expiry) : null;
-    const tags = [tag, "member"];
+    const tags = [`member-${tier}`, "gokollab"];
     const customFieldId = "dIg1gNeOG3xsWTE2lKEr";
     const customFields = dateString
       ? [{ id: customFieldId, value: dateString }]
@@ -142,6 +142,20 @@ const createGHLContact = async (name, email, phone, tag, expiry) => {
     throw error;
   }
 };
+
+const updateGHLContactTag = async (contactId, tag) => {
+  try {
+    await axios.post(
+      `https://rest.gohighlevel.com/v1/contacts/${contactId}/tags`,
+      { tags: [tag] },
+      { headers: { Authorization: `Bearer ${process.env.GHL_API_TOKEN}` } },
+    );
+  } catch (error) {
+    console.error("Error updating GHL tag:", error);
+    throw error;
+  }
+};
+
 const getStripePriceId = (tier, isDiscounted = false) => {
   // const priceMap = {
   //   "legacy-maker": {
@@ -276,10 +290,10 @@ app.post(
             m.tier === "legacy-maker"
               ? Number.MAX_SAFE_INTEGER
               : m.tier === "leader"
-              ? 5
-              : m.tier === "supporter"
-              ? 2
-              : 1;
+                ? 5
+                : m.tier === "supporter"
+                  ? 2
+                  : 1;
           m.lastCheck = null;
         });
         user.family.forEach((f) => {
@@ -287,10 +301,10 @@ app.post(
             f.tier === "legacy-maker"
               ? Number.MAX_SAFE_INTEGER
               : f.tier === "leader"
-              ? 5
-              : f.tier === "supporter"
-              ? 2
-              : 1;
+                ? 5
+                : f.tier === "supporter"
+                  ? 2
+                  : 1;
           f.lastCheck = null;
         });
         await user.save();
@@ -319,10 +333,10 @@ app.post("/api/users", async (req, res) => {
         memberships[0] === "legacy-maker"
           ? Number.MAX_SAFE_INTEGER
           : memberships[0] === "leader"
-          ? 5
-          : memberships[0] === "supporter"
-          ? 2
-          : 1,
+            ? 5
+            : memberships[0] === "supporter"
+              ? 2
+              : 1,
       paymentStatus: "pending",
     };
 
@@ -570,10 +584,10 @@ app.post("/api/payment", async (req, res) => {
             memberships[0] === "legacy-maker"
               ? Number.MAX_SAFE_INTEGER
               : memberships[0] === "leader"
-              ? 5
-              : memberships[0] === "supporter"
-              ? 2
-              : 1,
+                ? 5
+                : memberships[0] === "supporter"
+                  ? 2
+                  : 1,
           paymentStatus: "active",
           stripeItemId: subscription.items.data[0].id,
         };
@@ -857,8 +871,8 @@ app.post("/api/subscription/set-tier-quantity", async (req, res) => {
         item.price.id === getStripePriceId("legacy-maker")
           ? Number.MAX_SAFE_INTEGER
           : item.price.id === getStripePriceId("leader")
-          ? 5
-          : 2,
+            ? 5
+            : 2,
     }));
     await user.save();
     res.send({ success: true });
@@ -888,6 +902,21 @@ app.get("/api/subscription", async (req, res) => {
     res.status(500).send({ error: "Failed to retrieve subscription" });
   }
 });
+
+const removeGHLContactTag = async (contactId, tag) => {
+  try {
+    await axios.delete(
+      `https://rest.gohighlevel.com/v1/contacts/${contactId}/tags`,
+      {
+        data: { tags: [tag] },
+        headers: { Authorization: `Bearer ${process.env.GHL_API_TOKEN}` }
+      }
+    );
+  } catch (error) {
+    console.error("Error removing GHL tag:", error);
+    throw error;
+  }
+};
 
 app.post("/api/subscription/change-tier", async (req, res) => {
   const { currentTier, newTier, memberId } = req.body;
@@ -949,10 +978,16 @@ app.post("/api/subscription/change-tier", async (req, res) => {
       newTier === "legacy-maker"
         ? Number.MAX_SAFE_INTEGER
         : newTier === "leader"
-        ? 5
-        : newTier === "supporter"
-        ? 2
-        : 1;
+          ? 5
+          : newTier === "supporter"
+            ? 2
+            : 1;
+
+    // Update GHL tag for primary membership only
+    if (user.ghlContactId && !memberId) {
+      await removeGHLContactTag(user.ghlContactId, `member-${currentTier}`);
+      await updateGHLContactTag(user.ghlContactId, `member-${newTier}`);
+    }
 
     await user.save();
     res.send({ success: true });
@@ -961,7 +996,6 @@ app.post("/api/subscription/change-tier", async (req, res) => {
     res.status(500).send({ error: "Failed to change tier: " + error.message });
   }
 });
-
 app.post("/api/subscription/cancel-member", async (req, res) => {
   const { memberId } = req.body;
   const token = req.headers.authorization?.split(" ")[1];
@@ -1002,6 +1036,15 @@ app.post("/api/subscription/cancel-member", async (req, res) => {
       user.paymentStatus = "cancelled";
       user.memberships = [];
       user.family = [];
+
+      // Update GHL tag for cancellation
+      if (user.ghlContactId) {
+        const currentTier = user.memberships[0]?.tier;
+        if (currentTier) {
+          await removeGHLContactTag(user.ghlContactId, `member-${currentTier}`);
+        }
+        await updateGHLContactTag(user.ghlContactId, "membership-cancelled");
+      }
     }
 
     await user.save();
@@ -1011,7 +1054,6 @@ app.post("/api/subscription/cancel-member", async (req, res) => {
     res.status(500).send({ error: "Failed to cancel member subscription" });
   }
 });
-
 app.get("/api/invoices", async (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) {
@@ -1090,10 +1132,10 @@ app.post("/api/family", async (req, res) => {
       tier === "legacy-maker"
         ? Number.MAX_SAFE_INTEGER
         : tier === "leader"
-        ? 5
-        : tier === "supporter"
-        ? 2
-        : 1;
+          ? 5
+          : tier === "supporter"
+            ? 2
+            : 1;
 
     const familyMember = {
       _id: new mongoose.Types.ObjectId(),
@@ -1346,8 +1388,8 @@ app.post("/api/check-visit", async (req, res) => {
             m.tier === "walk-in"
               ? 3600000
               : m.tier === "legacy-maker"
-              ? 3600000
-              : 86400000;
+                ? 3600000
+                : 86400000;
           const sessionEnd = new Date(
             m.sessionStart.getTime() + sessionDuration,
           );
@@ -1395,8 +1437,8 @@ app.post("/api/check-visit", async (req, res) => {
             f.tier === "walk-in"
               ? 3600000
               : f.tier === "legacy-maker"
-              ? 3600000
-              : 86400000;
+                ? 3600000
+                : 86400000;
           const sessionEnd = new Date(
             f.sessionStart.getTime() + sessionDuration,
           );
@@ -1613,6 +1655,7 @@ app.post("/api/ghl/contact-delete", async (req, res) => {
 });
 
 // API endpoint for GHL to update user data
+// API endpoint for GHL to update user data
 app.post("/api/ghl/update-user", async (req, res) => {
   const { contact } = req.body;
   if (!contact) return res.status(400).send("Missing contact data");
@@ -1670,12 +1713,35 @@ app.post("/api/ghl/update-user", async (req, res) => {
     // Apply updates
     await User.updateOne({ _id: user._id }, { $set: updates });
 
+    // Check for "delete" tag
+    if (contact.tags && contact.tags.includes("delete")) {
+      // Cancel Stripe subscription if exists
+      if (user.stripeSubscriptionId) {
+        await stripe.subscriptions.del(user.stripeSubscriptionId);
+      }
+
+      // Cancel access to membership
+      user.paymentStatus = "cancelled";
+      user.memberships = [];
+      user.family = [];
+
+      // Remove current member tag if exists
+      const currentTier = user.memberships.length > 0 ? user.memberships[0].tier : null;
+      if (currentTier && contact.tags.includes(`member-${currentTier}`)) {
+        await removeGHLContactTag(contact.id, `member-${currentTier}`);
+      }
+
+      // Add cancelled tag
+      await updateGHLContactTag(contact.id, "membership-cancelled");
+
+      await user.save();
+    }
+
     res.status(200).send("User updated successfully");
   } catch (error) {
     console.error("GHL update error:", error);
     res.status(500).send("Server error");
   }
 });
-
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
