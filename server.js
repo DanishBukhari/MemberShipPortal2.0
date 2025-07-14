@@ -47,11 +47,13 @@ const UserSchema = new mongoose.Schema({
       lastCheck: Date,
       createdAt: { type: Date, default: Date.now },
       stripeItemId: String,
-      numAdults: { type: Number, default: 0 }, // ADD THIS
-      numChildren: { type: Number, default: 0 }, // ADD THIS
+      numHours: { type: Number, default: 1 }, // Changed from numAdults
+      numParticipants: { type: Number, default: 1 }, // Changed from numChildren
+      numNonParticipatingAdults: { type: Number, default: 0 }, // New field
+      hoursLeft: Number, // New for hourly deduction in walk-in
 
-      sessionStart: Date, // When hour-long session began
-      sessionEnd: Date, // When hour-long session ended
+      sessionStart: Date,
+      sessionEnd: Date,
     },
   ],
   photo: String,
@@ -75,13 +77,13 @@ const UserSchema = new mongoose.Schema({
       createdAt: { type: Date, default: Date.now },
       stripeItemId: String,
 
-      sessionStart: Date, // When hour-long session began
-      sessionEnd: Date, // When hour-long session ended
+      sessionStart: Date,
+      sessionEnd: Date,
     },
   ],
   familyTiers: [String],
-  numAdults: { type: Number, default: 0 },
-  numChildren: { type: Number, default: 0 },
+  numHours: { type: Number, default: 1 }, // Changed
+  numParticipants: { type: Number, default: 1 }, // Changed
   profileComplete: { type: Boolean, default: false },
   resetPasswordToken: String,
   resetPasswordExpires: Date,
@@ -89,7 +91,6 @@ const UserSchema = new mongoose.Schema({
   stripeSubscriptionId: String,
   familyItemIds: [String],
 });
-
 const User = mongoose.model("Users", UserSchema);
 
 const transporter = nodemailer.createTransport({
@@ -174,19 +175,19 @@ const getStripePriceId = (tier, isDiscounted = false) => {
   // };
 
   const priceMap = {
-    "legacy-maker": {
-      full: "price_1RfpatJqz3pkKu5cpxDdOKTy",
-      discounted: "price_1RfpbyJqz3pkKu5cE2LLL9Jr",
-    },
-    leader: {
-      full: "price_1RfpaXJqz3pkKu5c7xnLsO48",
-      discounted: "price_1RfpdnJqz3pkKu5cQgQN7Nk7",
-    },
-    supporter: {
-      full: "price_1RfpaFJqz3pkKu5cW4cZKkUa",
-      discounted: "price_1RfpeuJqz3pkKu5cc6lou0FU",
-    },
-  };
+     "legacy-maker": {
+       full: "price_1RfpatJqz3pkKu5cpxDdOKTy",
+       discounted: "price_1RfpbyJqz3pkKu5cE2LLL9Jr",
+     },
+     leader: {
+       full: "price_1RfpaXJqz3pkKu5c7xnLsO48",
+       discounted: "price_1RfpdnJqz3pkKu5cQgQN7Nk7",
+     },
+     supporter: {
+       full: "price_1RfpaFJqz3pkKu5cW4cZKkUa",
+       discounted: "price_1RfpeuJqz3pkKu5cc6lou0FU",
+     },
+   };
   return isDiscounted ? priceMap[tier].discounted : priceMap[tier].full;
 };
 
@@ -237,13 +238,16 @@ app.get("/api/admin/walk-ins", async (req, res) => {
             m.expiry <= endOfToday,
         )
         .forEach((membership) => {
+          // Inside the forEach loop for bookings.push
           bookings.push({
             _id: membership._id,
             membership: {
               ...membership.toObject(),
               amountDue: (
-                (membership.numAdults || 1) * 7 +
-                (membership.numChildren || 0) * 3.5
+                membership.numHours * 7 +  // First participant
+                membership.numHours * 3.5 * (membership.numParticipants - 1) +  // Additional participants
+                2.5 * (membership.numNonParticipatingAdults >= 1 ? 1 : 0) +  // First non-part
+                1 * (membership.numNonParticipatingAdults - 1 > 0 ? membership.numNonParticipatingAdults - 1 : 0)  // Additional non-part
               ).toFixed(2),
             },
             user: {
@@ -1197,15 +1201,19 @@ app.post("/api/walk-in", async (req, res) => {
     phone,
     tier,
     paymentMethod,
-    numAdults = 1,
-    numChildren = 0,
+    numHours = 1,
+    numParticipants = 1,
+    numNonParticipatingAdults = 0,
     selectedDate,
   } = req.body;
+
+  if (numParticipants < 1) {
+    return res.status(400).send({ error: "Number of participants must be at least 1" });
+  }
 
   const emailLower = email.toLowerCase();
 
   try {
-    // 1. Check for existing user with matching email AND phone
     let user = await User.findOne({
       email: emailLower,
       phone,
@@ -1230,15 +1238,16 @@ app.post("/api/walk-in", async (req, res) => {
       expiry: expiryDate,
       paymentStatus: "pending",
       createdAt: new Date(),
-      numAdults,
-      numChildren,
+      numHours,
+      numParticipants,
+      numNonParticipatingAdults,
+      hoursLeft: numHours,  // New: for hourly deduction
     };
 
     if (user) {
-      // 2. Found matching user - add membership
       user.memberships.push(membership);
-      user.numAdults = numAdults;
-      user.numChildren = numChildren;
+      user.numHours = numHours;
+      user.numParticipants = numParticipants;
     } else {
       // 3. No matching user - check for conflicts
       const existingEmail = await User.findOne({ email: emailLower });
@@ -1263,8 +1272,8 @@ app.post("/api/walk-in", async (req, res) => {
         email: emailLower,
         phone,
         memberships: [membership],
-        numAdults,
-        numChildren,
+        numHours,
+        numParticipants,
       });
     }
 
@@ -1389,8 +1398,8 @@ app.post("/api/check-visit", async (req, res) => {
             m.tier === "walk-in"
               ? 3600000
               : m.tier === "legacy-maker"
-                ? 3600000
-                : 86400000;
+              ? 3600000
+              : 86400000;
           const sessionEnd = new Date(
             m.sessionStart.getTime() + sessionDuration,
           );
@@ -1438,8 +1447,8 @@ app.post("/api/check-visit", async (req, res) => {
             f.tier === "walk-in"
               ? 3600000
               : f.tier === "legacy-maker"
-                ? 3600000
-                : 86400000;
+              ? 3600000
+              : 86400000;
           const sessionEnd = new Date(
             f.sessionStart.getTime() + sessionDuration,
           );
@@ -1479,7 +1488,6 @@ app.post("/api/check-visit", async (req, res) => {
     res.status(500).send({ error: "Failed to check visit" });
   }
 });
-
 app.get("/api/admin/user", async (req, res) => {
   const { phone } = req.query;
   try {
@@ -1503,21 +1511,27 @@ app.get("/api/admin/user", async (req, res) => {
           sessionDuration = 86400000; // 24 hours
         }
 
-        const sessionEnd = new Date(m.sessionStart.getTime() + sessionDuration);
+        const timePassed = now - new Date(m.sessionStart);
+        const hoursPassed = Math.floor(timePassed / 3600000);
 
-        // Check if session has ended
-        if (now > sessionEnd) {
-          // Deduct visits for non-legacy tiers
-          if (m.tier !== "legacy-maker") {
-            m.visitsLeft -= 1;
+        if (hoursPassed > 0) {
+          if (m.tier === "walk-in") {
+            m.hoursLeft -= hoursPassed;
+            if (m.hoursLeft < 0) m.hoursLeft = 0;
+          } else if (m.tier !== "legacy-maker") {
+            m.visitsLeft -= hoursPassed;
             if (m.visitsLeft < 0) m.visitsLeft = 0;
           }
 
-          // Clear session
-          m.sessionStart = null;
+          // Adjust sessionStart forward
+          m.sessionStart = new Date(m.sessionStart.getTime() + hoursPassed * 3600000);
 
-          // Mark as expired if no visits left
-          if (m.visitsLeft <= 0 && m.tier !== "legacy-maker") {
+          // Calculate new sessionEnd
+          const newSessionEnd = new Date(m.sessionStart.getTime() + sessionDuration);
+
+          // If last hour or expired
+          if (now > newSessionEnd || (m.tier === "walk-in" && m.hoursLeft <= 0) || (m.tier !== "legacy-maker" && m.visitsLeft <= 0)) {
+            m.sessionStart = null;
             m.paymentStatus = "expired";
           }
 
@@ -1546,17 +1560,24 @@ app.get("/api/admin/user", async (req, res) => {
           sessionDuration = 86400000; // 24 hours
         }
 
-        const sessionEnd = new Date(f.sessionStart.getTime() + sessionDuration);
+        const timePassed = now - new Date(f.sessionStart);
+        const hoursPassed = Math.floor(timePassed / 3600000);
 
-        if (now > sessionEnd) {
-          if (f.tier !== "legacy-maker") {
-            f.visitsLeft -= 1;
+        if (hoursPassed > 0) {
+          if (f.tier === "walk-in") {
+            f.hoursLeft -= hoursPassed;
+            if (f.hoursLeft < 0) f.hoursLeft = 0;
+          } else if (f.tier !== "legacy-maker") {
+            f.visitsLeft -= hoursPassed;
             if (f.visitsLeft < 0) f.visitsLeft = 0;
           }
 
-          f.sessionStart = null;
+          f.sessionStart = new Date(f.sessionStart.getTime() + hoursPassed * 3600000);
 
-          if (f.visitsLeft <= 0 && f.tier !== "legacy-maker") {
+          const newSessionEnd = new Date(f.sessionStart.getTime() + sessionDuration);
+
+          if (now > newSessionEnd || (f.tier === "walk-in" && f.hoursLeft <= 0) || (f.tier !== "legacy-maker" && f.visitsLeft <= 0)) {
+            f.sessionStart = null;
             f.paymentStatus = "expired";
           }
 
@@ -1589,8 +1610,10 @@ app.get("/api/admin/user", async (req, res) => {
         expiry: m.expiry,
         paymentStatus: m.paymentStatus,
         createdAt: m.createdAt,
-        numAdults: m.numAdults,
-        numChildren: m.numChildren,
+        numHours: m.numHours,
+        numParticipants: m.numParticipants,
+        numNonParticipatingAdults: m.numNonParticipatingAdults,
+        hoursLeft: m.hoursLeft,
         sessionStart: m.sessionStart, // Include session info in response
       })),
       paymentStatus: user.paymentStatus,
@@ -1607,8 +1630,8 @@ app.get("/api/admin/user", async (req, res) => {
         createdAt: f.createdAt,
         sessionStart: f.sessionStart, // Include session info in response
       })),
-      numAdults: user.numAdults,
-      numChildren: user.numChildren,
+      numHours: user.numHours,
+      numParticipants: user.numParticipants,
       stripeCustomerId: user.stripeCustomerId,
       stripeSubscriptionId: user.stripeSubscriptionId,
     };
@@ -1619,7 +1642,6 @@ app.get("/api/admin/user", async (req, res) => {
     res.status(500).send({ error: "Failed to retrieve user" });
   }
 });
-
 app.delete("/api/admin/delete-user", async (req, res) => {
   const { userId } = req.body;
   try {
@@ -1658,7 +1680,7 @@ app.post("/api/ghl/contact-delete", async (req, res) => {
 // API endpoint for GHL to update user data
 // API endpoint for GHL to update user data
 app.post("/api/ghl/update-user", async (req, res) => {
-  const { contact } = req.body;
+  const contact = req.body;
   if (!contact) return res.status(400).send("Missing contact data");
 
   try {
@@ -1729,11 +1751,11 @@ app.post("/api/ghl/update-user", async (req, res) => {
       // Remove current member tag if exists
       const currentTier = user.memberships.length > 0 ? user.memberships[0].tier : null;
       if (currentTier && contact.tags.includes(`member-${currentTier}`)) {
-        await removeGHLContactTag(contact.id, `member-${currentTier}`);
+        await removeGHLContactTag(user.ghlContactId, `member-${currentTier}`);
       }
 
       // Add cancelled tag
-      await updateGHLContactTag(contact.id, "membership-cancelled");
+      await updateGHLContactTag(user.ghlContactId, "membership-cancelled");
 
       await user.save();
     }
