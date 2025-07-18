@@ -175,19 +175,19 @@ const getStripePriceId = (tier, isDiscounted = false) => {
   // };
 
   const priceMap = {
-     "legacy-maker": {
-       full: "price_1RfpatJqz3pkKu5cpxDdOKTy",
-       discounted: "price_1RfpbyJqz3pkKu5cE2LLL9Jr",
-     },
-     leader: {
-       full: "price_1RfpaXJqz3pkKu5c7xnLsO48",
-       discounted: "price_1RfpdnJqz3pkKu5cQgQN7Nk7",
-     },
-     supporter: {
-       full: "price_1RfpaFJqz3pkKu5cW4cZKkUa",
-       discounted: "price_1RfpeuJqz3pkKu5cc6lou0FU",
-     },
-   };
+    "legacy-maker": {
+      full: "price_1ReTLmBQRG3WrNBRzfsYqcLa",
+      discounted: "price_1ReTaABQRG3WrNBRYO5r0WXb",
+    },
+    leader: {
+      full: "price_1ReTN8BQRG3WrNBRrarZEwBU",
+      discounted: "price_1ReTYtBQRG3WrNBRmHQ5uhM7",
+    },
+    supporter: {
+      full: "price_1ReTPxBQRG3WrNBRVtCCZMwX",
+      discounted: "price_1ReTXSBQRG3WrNBRDsi504MZ",
+    },
+  };
   return isDiscounted ? priceMap[tier].discounted : priceMap[tier].full;
 };
 
