@@ -1738,8 +1738,8 @@ app.post("/api/ghl/update-user", async (req, res) => {
 
     // Check for "delete" tag
    if (contact.tags && contact.tags.includes("delete")) {
-       contactId = contact.id || user.ghlContactId;
-       currentTier = user.memberships.length > 0 ? user.memberships[0].tier : null;
+       let contactId = contact.id || user.ghlContactId;
+       let currentTier = user.memberships.length > 0 ? user.memberships[0].tier : null;
 
       // Cancel Stripe subscription if exists, handle errors gracefully
       if (user.stripeSubscriptionId) {
