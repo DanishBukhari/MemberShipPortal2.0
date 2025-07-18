@@ -1737,10 +1737,18 @@ app.post("/api/ghl/update-user", async (req, res) => {
     await User.updateOne({ _id: user._id }, { $set: updates });
 
     // Check for "delete" tag
-    if (contact.tags && contact.tags.includes("delete")) {
-      // Cancel Stripe subscription if exists
+   if (contact.tags && contact.tags.includes("delete")) {
+       contactId = contact.id || user.ghlContactId;
+       currentTier = user.memberships.length > 0 ? user.memberships[0].tier : null;
+
+      // Cancel Stripe subscription if exists, handle errors gracefully
       if (user.stripeSubscriptionId) {
-        await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+        try {
+          await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+        } catch (stripeErr) {
+          console.error("Failed to cancel Stripe subscription:", stripeErr.message);
+          // Continue even if cancellation fails (e.g., already cancelled)
+        }
       }
 
       // Cancel access to membership
@@ -1748,26 +1756,30 @@ app.post("/api/ghl/update-user", async (req, res) => {
       user.memberships = [];
       user.family = [];
 
-      const contactId = contact.id || user.ghlContactId;
-      if (!contactId) {
-        throw new Error("No GHL contact ID available");
+
+      // Update GHL tags if contactId available
+      if (contactId) {
+        if (currentTier) {
+          try {
+            await removeGHLContactTag(contactId, `member-${currentTier}`);
+          } catch (tagErr) {
+            console.error("Failed to remove GHL tag:", tagErr.message);
+          }
+        }
+
+        try {
+          await updateGHLContactTag(contactId, "membership-cancelled");
+        } catch (tagErr) {
+          console.error("Failed to add GHL cancelled tag:", tagErr.message);
+        }
+      } else {
+        console.warn("No GHL contact ID available, skipping tag updates");
       }
 
-      // Set if not present
-      if (!user.ghlContactId) {
-        user.ghlContactId = contactId;
-      }
+      // Save user changes
+      await user.save()
 
-      // Remove current member tag if exists
-      const currentTier = user.memberships.length > 0 ? user.memberships[0].tier : null;
-      if (currentTier && contact.tags.includes(`member-${currentTier}`)) {
-        await removeGHLContactTag(contactId, `member-${currentTier}`);
-      }
-
-      // Add cancelled tag
-      await updateGHLContactTag(contactId, "membership-cancelled");
-
-      await user.save();
+      
     }
 
     res.status(200).send("User updated successfully");
