@@ -1647,7 +1647,7 @@ app.delete("/api/admin/delete-user", async (req, res) => {
   try {
     const user = await User.findById(userId);
     if (user && user.stripeSubscriptionId) {
-      await stripe.subscriptions.del(user.stripeSubscriptionId);
+      await stripe.subscriptions.cancel(user.stripeSubscriptionId);
     }
     await User.deleteOne({ _id: userId });
     res.status(200).send({
@@ -1740,7 +1740,7 @@ app.post("/api/ghl/update-user", async (req, res) => {
     if (contact.tags && contact.tags.includes("delete")) {
       // Cancel Stripe subscription if exists
       if (user.stripeSubscriptionId) {
-        await stripe.subscriptions.del(user.stripeSubscriptionId);
+        await stripe.subscriptions.cancel(user.stripeSubscriptionId);
       }
 
       // Cancel access to membership
